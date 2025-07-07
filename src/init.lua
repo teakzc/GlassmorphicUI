@@ -4,9 +4,10 @@
 
 local RunService = game:GetService("RunService")
 local CollectionService = game:GetService("CollectionService")
+local AssetService = game:GetService("AssetService")
 
 local EditableImageBlur, PixelColorApproximation
-local Packages = script:FindFirstChild("Packages") or script.Parent
+local Packages = script.Parent:FindFirstChild("Packages")
 local EditableImageBlurModule = Packages:FindFirstChild("EditableImageBlur")
 local PixelColorApproximationModule = Packages:FindFirstChild("PixelColorApproximation")
 
@@ -29,7 +30,8 @@ local EMPTY_TABLE = {}
 type GlassObject = {
 	Window: ImageLabel,
 	EditableImage: EditableImage,
-	Pixels: { number },
+	Pixels: buffer,
+	PixelCount: number,
 	PixelIndex: number,
 	InterlaceOffsetFlag: boolean,
 	Resolution: Vector2,
@@ -55,6 +57,18 @@ GlassmorphicUI.RADIUS = 5
 GlassmorphicUI.TEMPORAL_SMOOTHING = 0.75
 GlassmorphicUI.TAG_NAME = "GlassmorphicUI"
 GlassmorphicUI.BLUR_RADIUS_ATTRIBUTE_NAME = "BlurRadius"
+
+local function ExtendPixelBuffer(glassObject: GlassObject, pixelsNeeded: number)
+	local oldBuff = glassObject.Pixels
+    local bufLen = buffer.len(oldBuff)
+
+    while bufLen < pixelsNeeded do -- or do some stuff with logarithm
+        bufLen *= 2
+    end
+
+    local newBuff = buffer.create(bufLen)
+    buffer.copy(newBuff, 0, oldBuff, glassObject.PixelCount * 4)
+end
 
 function GlassmorphicUI.new(): ImageLabel
 	local Window = Instance.new("ImageLabel")
@@ -161,15 +175,16 @@ function GlassmorphicUI._getGlassObject(Window: ImageLabel): GlassObject
 		if ExistingEditableImage then
 			EditableImage = ExistingEditableImage
 		else
-			EditableImage = Instance.new("EditableImage")
-			EditableImage.Parent = Window
+			EditableImage = AssetService:CreateEditableImage()
+			Window.ImageContent = Content.fromObject(EditableImage)
 		end
 
 		glassObject = {
 			Window = Window,
 			EditableImage = EditableImage,
-			Pixels = {},
+			Pixels = buffer.create(8553600),
 			PixelIndex = 1,
+			PixelCount = 0,
 			InterlaceOffsetFlag = true,
 			Resolution = Vector2.one,
 			ResolutionInverse = Vector2.one,
@@ -277,8 +292,8 @@ function GlassmorphicUI._watchProperties(glassObject: GlassObject)
 end
 
 function GlassmorphicUI._updateWindowBlurRadius(glassObject: GlassObject, radius: number?)
-	if not radius then
-		radius = glassObject.Window:GetAttribute(GlassmorphicUI.BLUR_RADIUS_ATTRIBUTE_NAME)
+	if radius == nil then
+		radius = glassObject.Window:GetAttribute(GlassmorphicUI.BLUR_RADIUS_ATTRIBUTE_NAME) :: number
 	end
 	if type(radius) ~= "number" then
 		return
@@ -324,26 +339,40 @@ function GlassmorphicUI._updateWindowSize(glassObject: GlassObject)
 
 	glassObject.Resolution = Vector2.new(resolutionX, resolutionY)
 	glassObject.ResolutionInverse = Vector2.new(inverseResX, inverseResY)
-	glassObject.EditableImage.Size = glassObject.Resolution
+
+	local NewEditableImage = AssetService:CreateEditableImage({ Size = glassObject.Resolution  })
+	NewEditableImage:DrawImage(Vector2.zero, glassObject.EditableImage, Enum.ImageCombineType.Overwrite)
+	
+	glassObject.EditableImage:Destroy()
+
+	glassObject.EditableImage = NewEditableImage
 
 	-- Ensure the pixels array is correct size
 	local Pixels = glassObject.Pixels
 	local WindowColor = glassObject.WindowColor
 
 	local pixelsArrayLength = resolutionX * resolutionY * 4
-	local pixelsArrayCurrentLength = #Pixels
-	if pixelsArrayCurrentLength > pixelsArrayLength then
+	local pixelsArrayCurrentLength = buffer.len(Pixels)
+
+	if pixelsArrayCurrentLength < pixelsArrayLength then
+		glassObject.PixelCount = pixelsArrayLength / 4
 		-- Remove extra pixel data by moving empties in after the pixelsArrayLength
+		for i = 0, pixelsArrayCurrentLength - pixelsArrayLength - 1 do
+			buffer.writeu8(Pixels, 2 * pixelsArrayLength + i, 0)
+		end
 		table.move(EMPTY_TABLE, 1, pixelsArrayCurrentLength - pixelsArrayLength, pixelsArrayLength + 1, Pixels)
-	elseif pixelsArrayCurrentLength < pixelsArrayLength then
-		-- Add new pixels
-		for i = pixelsArrayCurrentLength + 1, pixelsArrayLength do
+	else
+		if buffer.len(Pixels) < pixelsArrayLength then
+        	ExtendPixelBuffer(glassObject, pixelsArrayLength)
+    	end
+
+		for i = pixelsArrayCurrentLength, pixelsArrayLength - 1 do
 			local mod4 = i % 4
 			if mod4 == 0 then
 				-- Fully opaque alpha channel
-				Pixels[i] = 1
+				buffer.writeu8(Pixels, i, 1)
 			else
-				Pixels[i] = WindowColor[mod4] or 1
+				buffer.writeu8(Pixels, i, WindowColor[mod4] or 1)
 			end
 		end
 	end
@@ -369,10 +398,10 @@ function GlassmorphicUI._processNextPixel(glassObject: GlassObject, skipTween: b
 
 		-- Set entire image to window color
 		local r, g, b = WindowColor[1], WindowColor[2], WindowColor[3]
-		for i = 1, #Pixels, 4 do
-			Pixels[i] = r
-			Pixels[i + 1] = g
-			Pixels[i + 2] = b
+		for i = 1, buffer.len(Pixels), 4 do
+			buffer.writeu8(Pixels, i, r)
+			buffer.writeu8(Pixels, i + 1, g)
+			buffer.writeu8(Pixels, i + 2, b)
 		end
 
 		-- Move index back to start
@@ -404,18 +433,18 @@ function GlassmorphicUI._processNextPixel(glassObject: GlassObject, skipTween: b
 	color[3] = (1 - windowAlpha) * color[3] + windowAlpha * WindowColor[3]
 
 	if skipTween then
-		Pixels[PixelIndex] = color[1]
-		Pixels[PixelIndex + 1] = color[2]
-		Pixels[PixelIndex + 2] = color[3]
+		buffer.writeu8(Pixels, PixelIndex, color[1])
+		buffer.writeu8(Pixels, PixelIndex + 1, color[2])
+		buffer.writeu8(Pixels, PixelIndex + 2, color[3])
 	else
-		local prevR, prevG, prevB = Pixels[PixelIndex], Pixels[PixelIndex + 1], Pixels[PixelIndex + 2]
-		Pixels[PixelIndex] = prevR + (color[1] - prevR) * GlassmorphicUI.TEMPORAL_SMOOTHING
-		Pixels[PixelIndex + 1] = prevG + (color[2] - prevG) * GlassmorphicUI.TEMPORAL_SMOOTHING
-		Pixels[PixelIndex + 2] = prevB + (color[3] - prevB) * GlassmorphicUI.TEMPORAL_SMOOTHING
+		local prevR, prevG, prevB = buffer.readu8(Pixels, PixelIndex), buffer.readu8(Pixels, PixelIndex + 1), buffer.readu8(Pixels, PixelIndex + 2)
+		buffer.writeu8(Pixels, PixelIndex, prevR + (color[1] - prevR) * GlassmorphicUI.TEMPORAL_SMOOTHING)
+		buffer.writeu8(Pixels, PixelIndex + 1, prevG + (color[2] - prevG) * GlassmorphicUI.TEMPORAL_SMOOTHING)
+		buffer.writeu8(Pixels, PixelIndex + 2, prevB + (color[3] - prevB) * GlassmorphicUI.TEMPORAL_SMOOTHING)
 	end
 
 	PixelIndex += 8
-	if PixelIndex > #Pixels then
+	if PixelIndex > buffer.len(Pixels) then
 		glassObject.InterlaceOffsetFlag = not glassObject.InterlaceOffsetFlag
 		PixelIndex = if glassObject.InterlaceOffsetFlag then 1 else 5
 	end
