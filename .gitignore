@@ -4,9 +4,6 @@
 /*.rbxm
 /*.rbxmx
 
-# Wally managed packages
-Packages
-
 # Roblox Studio lock files
 /*.rbxlx.lock
 /*.rbxl.lock
